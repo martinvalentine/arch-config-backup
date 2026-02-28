@@ -24,26 +24,47 @@ check_niri() {
 # =============================================================================
 # 3. prune_to_latest(pattern, n)
 # =============================================================================
+# Prune backups to keep only N newest (by mtime)
 prune_to_latest() {
-    local pattern="$1"
+    local type="$1"
     local keep="$2"
-    local files
-    mapfile -t files < <(find "$DEST_DIR" -maxdepth 1 -name "$pattern" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +$((keep + 1)) | cut -d' ' -f2-)
-    for f in "${files[@]}"; do
-        [ -n "$f" ] && rm -f "$f"
+    local paths
+    mapfile -t paths < <(get_backup_list "$type")
+    local count=${#paths[@]}
+    local to_remove=$((count - keep))
+    if [ "$to_remove" -le 0 ]; then
+        return 0
+    fi
+    local i
+    for ((i = keep; i < count; i++)); do
+        local p="${paths[$i]}"
+        [ -n "$p" ] || continue
+        if [ -d "$p" ]; then
+            rm -rf "$p"
+        else
+            rm -f "$p"
+        fi
     done
 }
 
-# Count backups matching pattern
+# Count backups matching pattern (supports multi-pattern for niri: tar.gz, zip, folder)
 count_backups() {
-    local pattern="$1"
-    find "$DEST_DIR" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
+    local type="$1"
+    if [ "$type" = "hyprland" ]; then
+        find "$DEST_DIR" -maxdepth 1 -name "hyprland_*_backup_*.conf" -type f 2>/dev/null | wc -l
+    else
+        find "$DEST_DIR" -maxdepth 1 \( -name "niri_*_backup_*.tar.gz" -o -name "niri_*_backup_*.zip" -o \( -name "niri_*_backup_*" -type d \) \) 2>/dev/null | wc -l
+    fi
 }
 
 # Get list of backups sorted by mtime (newest first)
 get_backup_list() {
-    local pattern="$1"
-    find "$DEST_DIR" -maxdepth 1 -name "$pattern" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+    local type="$1"
+    if [ "$type" = "hyprland" ]; then
+        find "$DEST_DIR" -maxdepth 1 -name "hyprland_*_backup_*.conf" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+    else
+        find "$DEST_DIR" -maxdepth 1 \( -name "niri_*_backup_*.tar.gz" -o -name "niri_*_backup_*.zip" -o \( -name "niri_*_backup_*" -type d \) \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+    fi
 }
 
 # =============================================================================
@@ -53,15 +74,9 @@ manage_backups_menu() {
     local type="$1"       # "hyprland" or "niri"
     local require_prune="$2"
 
-    if [ "$type" = "hyprland" ]; then
-        local pattern="hyprland_*_backup_*.conf"
-    else
-        local pattern="niri_*_backup_*.tar.gz"
-    fi
-
     while true; do
         local count
-        count=$(count_backups "$pattern")
+        count=$(count_backups "$type")
         [ -z "$count" ] && count=0
 
         if [ "$require_prune" = "true" ] && [ "$count" -le "$MAX_BACKUPS" ]; then
@@ -70,7 +85,7 @@ manage_backups_menu() {
         fi
 
         local files
-        mapfile -t files < <(get_backup_list "$pattern")
+        mapfile -t files < <(get_backup_list "$type")
 
         if [ ${#files[@]} -eq 0 ]; then
             if command -v dialog &>/dev/null; then
@@ -138,22 +153,21 @@ manage_backups_menu() {
             [[ $REPLY =~ ^[Yy]$ ]] && confirmed=1
         fi
 
-        if [ -n "$confirmed" ] && [ -f "$to_remove" ]; then
-            rm -f "$to_remove"
+        if [ -n "$confirmed" ]; then
+            if [ -d "$to_remove" ]; then
+                rm -rf "$to_remove"
+            elif [ -f "$to_remove" ]; then
+                rm -f "$to_remove"
+            fi
         fi
     done
 }
 
 retention_prompt() {
     local type="$1"
-    if [ "$type" = "hyprland" ]; then
-        local pattern="hyprland_*_backup_*.conf"
-    else
-        local pattern="niri_*_backup_*.tar.gz"
-    fi
 
     local count
-    count=$(count_backups "$pattern")
+    count=$(count_backups "$type")
     [ -z "$count" ] && count=0
 
     if [ "$count" -le "$MAX_BACKUPS" ]; then
@@ -180,7 +194,7 @@ retention_prompt() {
 
     case "$choice" in
         prune)
-            prune_to_latest "$pattern" "$MAX_BACKUPS"
+            prune_to_latest "$type" "$MAX_BACKUPS"
             ;;
         manage)
             manage_backups_menu "$type" "true"
@@ -211,19 +225,78 @@ do_backup_hyprland() {
 }
 
 do_backup_niri() {
-    local dest_file="${DEST_DIR}/niri_${CURRENT_DATE}_backup_${CURRENT_TIME}.tar.gz"
-    if tar -czf "$dest_file" -C "$HOME/.config" niri 2>/dev/null; then
+    local base_name="niri_${CURRENT_DATE}_backup_${CURRENT_TIME}"
+    local format=""
+    if command -v dialog &>/dev/null; then
+        format=$(dialog --stdout --title "Niri backup format" \
+            --menu "Choose backup format:" 11 45 3 \
+            "tar.gz" "Compressed tarball (recommended)" \
+            "zip" "ZIP archive (portable)" \
+            "folder" "Plain folder copy (easy to browse)" 2>/dev/null)
+    else
+        echo "Niri backup format:"
+        echo "1) tar.gz - Compressed tarball (recommended)"
+        echo "2) zip - ZIP archive (portable)"
+        echo "3) folder - Plain folder copy (easy to browse)"
+        local input
+        read -p "Choice [1]: " input || input=""
+        case "${input:-1}" in
+            1) format="tar.gz" ;;
+            2) format="zip" ;;
+            3) format="folder" ;;
+            *) format="tar.gz" ;;
+        esac
+    fi
+
+    [ -z "$format" ] && return 0
+
+    local dest_path="${DEST_DIR}/${base_name}"
+    local success=0
+
+    case "$format" in
+        tar.gz)
+            dest_path="${dest_path}.tar.gz"
+            if tar -czf "$dest_path" -C "$HOME/.config" niri 2>/dev/null; then
+                success=1
+            fi
+            ;;
+        zip)
+            dest_path="${dest_path}.zip"
+            if command -v zip &>/dev/null; then
+                local abs_dest
+                abs_dest="$(cd -P "$DEST_DIR" 2>/dev/null && pwd)/${base_name}.zip"
+                (cd "$HOME/.config" && zip -rq "$abs_dest" niri) 2>/dev/null && success=1
+            else
+                if command -v dialog &>/dev/null; then
+                    dialog --msgbox "zip is not installed. Run: pacman -S zip" 6 50
+                else
+                    echo "Error: zip is not installed. Run: pacman -S zip"
+                fi
+                return 1
+            fi
+            ;;
+        folder)
+            if cp -r "$NIRI_SOURCE" "$dest_path" 2>/dev/null; then
+                success=1
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    if [ "$success" -eq 1 ]; then
         if command -v dialog &>/dev/null; then
-            dialog --msgbox "Backup created:\n$dest_file" 6 50
+            dialog --msgbox "Backup created:\n$dest_path" 6 50
         else
-            echo "Success: Backup created at $dest_file"
+            echo "Success: Backup created at $dest_path"
         fi
         retention_prompt "niri"
     else
         if command -v dialog &>/dev/null; then
-            dialog --msgbox "Error: Failed to create tarball." 5 40
+            dialog --msgbox "Error: Failed to create backup." 5 40
         else
-            echo "Error: Failed to create tarball."
+            echo "Error: Failed to create backup."
         fi
         return 1
     fi
