@@ -202,18 +202,76 @@ retention_prompt() {
     esac
 }
 
+# When dest path exists, ask user to overwrite or cancel. Returns 0=proceed, 1=cancel
+confirm_overwrite() {
+    local path="$1"
+    [ ! -e "$path" ] && return 0
+    local choice=""
+    if command -v dialog &>/dev/null && [ -t 0 ]; then
+        if dialog --stdout --title "File exists" --yesno "Overwrite existing backup?\n$path" 7 55; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        echo "File already exists: $path"
+        local input
+        read -p "Overwrite? [y/N] " -n 1 -r input || input=""
+        echo
+        [[ "$input" =~ ^[Yy]$ ]] && return 0
+        return 1
+    fi
+}
+
+# Ask user: timestamped (unique) or stable (fixed name, overwrites)
+# Sets global NAMING_CHOICE (avoids subshell stdin issues when piped)
+ask_naming() {
+    local choice=""
+    if command -v dialog &>/dev/null && [ -t 0 ]; then
+        choice=$(dialog --stdout --title "Backup naming" \
+            --menu "Save as:" 10 50 2 \
+            "timestamped" "Timestamped (unique file each time)" \
+            "stable" "Stable (fixed name, overwrites previous)" 2>/dev/null)
+    fi
+    if [ -z "$choice" ]; then
+        echo "Save as:"
+        echo "1) Timestamped - unique file each time"
+        echo "2) Stable - fixed name, overwrites previous"
+        local input
+        read -p "Choice [1]: " input || input=""
+        case "${input:-1}" in
+            1) choice="timestamped" ;;
+            2) choice="stable" ;;
+            *) choice="timestamped" ;;
+        esac
+    fi
+    NAMING_CHOICE="${choice:-timestamped}"
+}
+
 # =============================================================================
 # 5. do_backup_hyprland, do_backup_niri
 # =============================================================================
 do_backup_hyprland() {
-    local dest_file="${DEST_DIR}/hyprland_${CURRENT_DATE}_backup_${CURRENT_TIME}.conf"
+    local naming
+    ask_naming
+    naming="${NAMING_CHOICE:-timestamped}"
+    [ -z "$naming" ] && return 0
+
+    local dest_file
+    if [ "$naming" = "stable" ]; then
+        dest_file="${DEST_DIR}/hyprland_backup.conf"
+        confirm_overwrite "$dest_file" || return 0
+    else
+        dest_file="${DEST_DIR}/hyprland_${CURRENT_DATE}_backup_${CURRENT_TIME}.conf"
+    fi
+
     if cp "$HYPRLAND_SOURCE" "$dest_file"; then
         if command -v dialog &>/dev/null; then
             dialog --msgbox "Backup created:\n$dest_file" 6 50
         else
             echo "Success: Backup created at $dest_file"
         fi
-        retention_prompt "hyprland"
+        [ "$naming" = "timestamped" ] && retention_prompt "hyprland"
     else
         if command -v dialog &>/dev/null; then
             dialog --msgbox "Error: Failed to copy file." 5 40
@@ -225,7 +283,18 @@ do_backup_hyprland() {
 }
 
 do_backup_niri() {
-    local base_name="niri_${CURRENT_DATE}_backup_${CURRENT_TIME}"
+    local naming
+    ask_naming
+    naming="${NAMING_CHOICE:-timestamped}"
+    [ -z "$naming" ] && return 0
+
+    local base_name
+    if [ "$naming" = "stable" ]; then
+        base_name="niri_backup"
+    else
+        base_name="niri_${CURRENT_DATE}_backup_${CURRENT_TIME}"
+    fi
+
     local format=""
     if command -v dialog &>/dev/null; then
         format=$(dialog --stdout --title "Niri backup format" \
@@ -256,12 +325,18 @@ do_backup_niri() {
     case "$format" in
         tar.gz)
             dest_path="${dest_path}.tar.gz"
+            if [ "$naming" = "stable" ]; then
+                confirm_overwrite "$dest_path" || return 0
+            fi
             if tar -czf "$dest_path" -C "$HOME/.config" niri 2>/dev/null; then
                 success=1
             fi
             ;;
         zip)
             dest_path="${dest_path}.zip"
+            if [ "$naming" = "stable" ]; then
+                confirm_overwrite "$dest_path" || return 0
+            fi
             if command -v zip &>/dev/null; then
                 local abs_dest
                 abs_dest="$(cd -P "$DEST_DIR" 2>/dev/null && pwd)/${base_name}.zip"
@@ -276,6 +351,10 @@ do_backup_niri() {
             fi
             ;;
         folder)
+            if [ "$naming" = "stable" ] && [ -e "$dest_path" ]; then
+                confirm_overwrite "$dest_path" || return 0
+                rm -rf "$dest_path"
+            fi
             if cp -r "$NIRI_SOURCE" "$dest_path" 2>/dev/null; then
                 success=1
             fi
@@ -291,7 +370,7 @@ do_backup_niri() {
         else
             echo "Success: Backup created at $dest_path"
         fi
-        retention_prompt "niri"
+        [ "$naming" = "timestamped" ] && retention_prompt "niri"
     else
         if command -v dialog &>/dev/null; then
             dialog --msgbox "Error: Failed to create backup." 5 40
